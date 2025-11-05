@@ -1,47 +1,41 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/**
- * @title ReplicatedVerifier
- * @notice A smart contract to manage a replicated outsourced computation
- * task between a client and two servers (Server A and Server B).
- * It uses deposits and result matching to ensure a secure outcome.
- */
 contract ReplicatedVerifier {
+    struct Ciphertext {
+        bytes C1;
+        bytes C2;
+        bytes C3;
+        bytes pubKeyId;
+        address submitter;
+        bool exists;
+    }
+
     struct Task {
         address client;
-        uint256 stakeAmount; // Required deposit from each server
-        bytes32 taskHash;    // Hash of the function f() and input x
-        bytes32 resultA;     // Commitment (hash) of Server A's result
-        bytes32 resultB;     // Commitment (hash) of Server B's result
+        uint256 stakeAmount;
+        bytes32 taskHash;
         address serverA;
         address serverB;
         bool isCompleted;
     }
 
-    // Mapping to store tasks, indexed by a unique taskId
     mapping(uint256 => Task) public tasks;
+    mapping(uint256 => mapping(address => Ciphertext)) public submissions;
     uint256 public nextTaskId = 1;
 
-    // Events for transparency
-    event TaskCreated(uint256 taskId, address client, bytes32 taskHash);
-    event ResultSubmitted(uint256 taskId, address server, bytes32 resultHash);
-    event TaskResolved(uint256 taskId, bool resultsMatch, address winner);
+    event TaskCreated(uint256 indexed taskId, address client, bytes32 taskHash, address serverA, address serverB, uint256 stakeAmount);
+    event ResultSubmitted(uint256 indexed taskId, address server, bytes32 testHash);
+    event CiphertextSelected(uint256 indexed taskId, bytes C1, bytes C2, bytes C3, bytes pubKeyId);
+    event CiphertextMismatch(uint256 indexed taskId);
+    event TaskResolved(uint256 indexed taskId, bool resultsMatch);
 
-    // Error definitions (Solidity 0.8.4+)
     error InvalidServerDeposit();
     error TaskNotActive();
     error NotAuthorized();
     error TaskAlreadyCompleted();
-    error ResultAlreadySubmitted();
+    error ResultsNotSubmitted();
 
-    /**
-     * @notice Client initiates a new computation task.
-     * @param _taskHash A hash representing the function f() and input x.
-     * @param _serverA The address of the first server.
-     * @param _serverB The address of the second server.
-     * @param _stakeAmount The ETH amount required as a deposit from each server.
-     */
     function createTask(
         bytes32 _taskHash,
         address _serverA,
@@ -55,100 +49,88 @@ contract ReplicatedVerifier {
             client: msg.sender,
             stakeAmount: _stakeAmount,
             taskHash: _taskHash,
-            resultA: 0,
-            resultB: 0,
             serverA: _serverA,
             serverB: _serverB,
             isCompleted: false
         });
 
-        emit TaskCreated(taskId, msg.sender, _taskHash);
+        emit TaskCreated(taskId, msg.sender, _taskHash, _serverA, _serverB, _stakeAmount);
         return taskId;
     }
 
-    /**
-     * @notice Servers submit their result commitment (a hash of the result).
-     * The Server's deposit is sent as msg.value.
-     * @param _taskId The ID of the task.
-     * @param _resultHash The hash of the computation result.
-     */
-    function submitResult(uint256 _taskId, bytes32 _resultHash) external payable {
-        Task storage task = tasks[_taskId];
-
-        if (task.client == address(0) || task.isCompleted) revert TaskNotActive();
-
-        if (msg.value != task.stakeAmount) revert InvalidServerDeposit();
-
-        // Server A logic
-        if (msg.sender == task.serverA) {
-            if (task.resultA != 0) revert ResultAlreadySubmitted();
-            task.resultA = _resultHash;
-        // Server B logic
-        } else if (msg.sender == task.serverB) {
-            if (task.resultB != 0) revert ResultAlreadySubmitted();
-            task.resultB = _resultHash;
-        } else {
-            revert NotAuthorized();
-        }
-
-        emit ResultSubmitted(_taskId, msg.sender, _resultHash);
+    function computeTestHash(bytes memory C1, bytes memory C2, bytes memory C3, bytes memory pubKeyId) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(C1, C2, C3, pubKeyId));
     }
 
-    /**
-     * @notice The client calls this function once both servers have submitted results.
-     * This is where the actual result comparison (the verification) happens.
-     * @dev In a real system, the client would submit the *actual* result, not just a hash,
-     * to prove the computation. For this implementation, we simply check the submitted hashes.
-     * @param _taskId The ID of the task.
-     */
+    function submitResult(
+        uint256 _taskId,
+        bytes calldata C1,
+        bytes calldata C2,
+        bytes calldata C3,
+        bytes calldata pubKeyId
+    ) external payable {
+        Task storage t = tasks[_taskId];
+        if (t.client == address(0) || t.isCompleted) revert TaskNotActive();
+        if (msg.value != t.stakeAmount) revert InvalidServerDeposit();
+
+        address sender = msg.sender;
+        require(sender == t.serverA || sender == t.serverB, "Not authorized server");
+
+        Ciphertext storage ct = submissions[_taskId][sender];
+        require(!ct.exists, "Result already submitted");
+
+        submissions[_taskId][sender] = Ciphertext({
+            C1: C1,
+            C2: C2,
+            C3: C3,
+            pubKeyId: pubKeyId,
+            submitter: sender,
+            exists: true
+        });
+
+        bytes32 testHash = computeTestHash(C1, C2, C3, pubKeyId);
+        emit ResultSubmitted(_taskId, sender, testHash);
+    }
+
     function resolveTask(uint256 _taskId) external {
-        Task storage task = tasks[_taskId];
-        if (msg.sender != task.client) revert NotAuthorized();
-        if (task.resultA == 0 || task.resultB == 0) revert("Results not fully submitted.");
-        if (task.isCompleted) revert TaskAlreadyCompleted();
+        Task storage t = tasks[_taskId];
+        if (msg.sender != t.client) revert NotAuthorized();
+        if (t.isCompleted) revert TaskAlreadyCompleted();
 
-        task.isCompleted = true;
+        Ciphertext storage a = submissions[_taskId][t.serverA];
+        Ciphertext storage b = submissions[_taskId][t.serverB];
+        if (!a.exists || !b.exists) revert ResultsNotSubmitted();
 
-        // **The Replication Verification Logic:**
-        if (task.resultA == task.resultB) {
-            // Case 1: Results Match (Honest path or successful collusion)
-            // Both servers get their stake back + payment from client (msg.value)
-            uint256 clientPayment = address(this).balance - (task.stakeAmount * 2);
+        bytes32 ha = computeTestHash(a.C1, a.C2, a.C3, a.pubKeyId);
+        bytes32 hb = computeTestHash(b.C1, b.C2, b.C3, b.pubKeyId);
+
+        t.isCompleted = true;
+
+        if (ha == hb) {
+            // Results match: both servers rewarded + return ciphertext
+            emit CiphertextSelected(_taskId, a.C1, a.C2, a.C3, a.pubKeyId);
+            // compute client payment available in contract
+            uint256 clientPayment = address(this).balance - (t.stakeAmount * 2);
             uint256 serverReward = clientPayment / 2;
-
-            // Pay Server A: Deposit + Half of Client's Payment
-            (bool successA, ) = task.serverA.call{value: task.stakeAmount + serverReward}("");
-            require(successA, "Transfer to Server A failed.");
-
-            // Pay Server B: Deposit + Half of Client's Payment
-            (bool successB, ) = task.serverB.call{value: task.stakeAmount + serverReward}("");
-            require(successB, "Transfer to Server B failed.");
-            
-            // The remaining small amount (if clientPayment is odd) goes to the client.
+            // Pay serverA
+            (bool successA, ) = t.serverA.call{ value: t.stakeAmount + serverReward }("");
+            require(successA, "Transfer to Server A failed");
+            // Pay serverB
+            (bool successB, ) = t.serverB.call{ value: t.stakeAmount + serverReward }("");
+            require(successB, "Transfer to Server B failed");
+            // Remaining (if any) returns to client
             uint256 remaining = address(this).balance;
-            (bool successClient, ) = task.client.call{value: remaining}("");
-            require(successClient, "Transfer remaining to Client failed.");
-
-            emit TaskResolved(_taskId, true, address(0)); // Winner is N/A
+            (bool successC, ) = t.client.call{ value: remaining }("");
+            require(successC, "Transfer remaining to client failed");
+            emit TaskResolved(_taskId, true);
         } else {
-            // Case 2: Results Mismatch (Copy attack or honest error/dispute)
-            // The contract cannot determine the correct result without a complex
-            // challenge-response protocol (like a Merkle tree proof).
-            // In the spirit of the "Prisoner's Contract" (economic incentive):
-            // The client must initiate a separate process to prove which is correct,
-            // or the payment is forfeited as a penalty.
-            // **For simplicity, we return the client's original payment and forfeit server stakes.**
-            
-            // Refund the client's payment (original msg.value)
-            uint256 clientRefund = address(this).balance - (task.stakeAmount * 2);
-            (bool successClient, ) = task.client.call{value: clientRefund}("");
-            require(successClient, "Client refund failed.");
-
-            // Server Stakes are locked/lost, acting as a penalty for the servers.
-            // In a real system, the honest server would receive the dishonest one's stake.
-            // Here, for simplicity, they are forfeit to the contract/network (not implemented).
-
-            emit TaskResolved(_taskId, false, address(0));
+            // Results mismatch: refund client, forfeit server stakes
+            emit CiphertextMismatch(_taskId);
+            uint256 clientRefund = address(this).balance - (t.stakeAmount * 2);
+            (bool successC, ) = t.client.call{ value: clientRefund }("");
+            require(successC, "Client refund failed");
+            // Server stakes stay in contract (forfeit)
+            emit TaskResolved(_taskId, false);
         }
     }
 }
