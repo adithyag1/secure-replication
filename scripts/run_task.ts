@@ -1,118 +1,167 @@
 import { network } from "hardhat";
 const { ethers } = await network.connect();
 
+const generateSubmission = (result: string, serverAddress: string) => {
+  const resultBytes = ethers.toUtf8Bytes("RESULT|" + result);
+  const nonceBytes = ethers.toUtf8Bytes("NONCE|" + serverAddress);
+  
+  const commitment = ethers.keccak256(
+    ethers.concat([
+      resultBytes,
+      nonceBytes,
+      serverAddress
+    ])
+  );
+
+  return { result: resultBytes, nonce: nonceBytes, commitment: commitment };
+};
+
 async function runScenario(
   scenarioName: string,
   client: any,
-  serverA: any,
-  serverB: any,
+  servers: any[],
   verifier: any,
   taskId: number,
-  cipherSeedA: string,
-  cipherSeedB: string,
+  resultSeeds: string[],
   STAKE_AMOUNT: bigint,
   CLIENT_PAYMENT: bigint,
   TASK_HASH: string
-) {
-  console.log(`\n\n--- SCENARIO ${taskId}: ${scenarioName} ---`);
+): Promise<boolean> { 
+  console.log(`\n\n--- SCENARIO ${taskId}: ${scenarioName} (N=${servers.length}) ---`);
+  
+  const serverAddresses = servers.map(s => s.address);
 
-  // 2. Client Creating Task
+  const submissionsData = servers.map((server, i) => 
+    generateSubmission(resultSeeds[i], server.address)
+  );
+
   console.log(`\n2. Client Creating Task ${taskId} (sending payment ${CLIENT_PAYMENT} ETH)`);
+  
   await verifier.connect(client).createTask(
     TASK_HASH,
-    serverA.address,
-    serverB.address,
+    serverAddresses,
     STAKE_AMOUNT,
     { value: CLIENT_PAYMENT }
   );
-  console.log(`Task ${taskId} created.`);
+  console.log(`Task ${taskId} created for ${servers.length} servers.`);
 
-  // 3. Servers submit results
-  console.log("\n3. Servers submitting results...");
-  const fakeCiphertext = (seed: string) => {
-    const C1 = ethers.keccak256(ethers.toUtf8Bytes("C1|" + seed));
-    const C2 = ethers.keccak256(ethers.toUtf8Bytes("C2|" + seed));
-    const C3 = ethers.keccak256(ethers.toUtf8Bytes("C3|" + seed));
-    const pk = ethers.keccak256(ethers.toUtf8Bytes("pk|" + seed));
-    return { C1, C2, C3, pk };
-  };
+  console.log("\n3. Servers committing results (staking)...");
+  
+  for (let i = 0; i < servers.length; i++) {
+    await verifier.connect(servers[i]).commitResult(
+      taskId,
+      submissionsData[i].commitment,
+      { value: STAKE_AMOUNT }
+    );
+  }
+  console.log("All servers committed.");
 
-  const ctA = fakeCiphertext(cipherSeedA);
-  const ctB = fakeCiphertext(cipherSeedB);
+  console.log("\n4. Servers revealing results (showing plaintext)...");
+  
+  for (let i = 0; i < servers.length; i++) {
+    await verifier.connect(servers[i]).revealResult(
+      taskId,
+      submissionsData[i].result,
+      submissionsData[i].nonce
+    );
+  }
+  console.log("All servers revealed.");
 
-  await verifier.connect(serverA).submitResult(
-    taskId,
-    ctA.C1,
-    ctA.C2,
-    ctA.C3,
-    ctA.pk,
-    { value: STAKE_AMOUNT }
-  );
-  console.log("Server A submitted result.");
 
-  await verifier.connect(serverB).submitResult(
-    taskId,
-    ctB.C1,
-    ctB.C2,
-    ctB.C3,
-    ctB.pk,
-    { value: STAKE_AMOUNT }
-  );
-  console.log("Server B submitted result.");
+  console.log("\n5. Client Resolving Task and checking result...");
+  
+  const tx = await verifier.connect(client).resolveTask(taskId);
+  const receipt = await tx.wait();
 
-  // 4. Client resolves task
-  console.log("\n4. Client Resolving Task...");
-  await verifier.connect(client).resolveTask(taskId);
-  console.log(`Task ${taskId} resolved.`);
+  let majorityReached = false;
+  let foundEvent = false;
+  let majorityCount = 0;
+
+  if (receipt && receipt.logs) {
+    for (const log of receipt.logs) {
+      try {
+        const parsedLog = verifier.interface.parseLog(log);
+        if (parsedLog && parsedLog.name === "TaskResolved") {
+          majorityReached = parsedLog.args[1]; 
+          majorityCount = parsedLog.args[3]; 
+          foundEvent = true;
+          break;
+        }
+      } catch (e) {
+        // Ignore logs
+      }
+    }
+  }
+
+  if (!foundEvent) {
+    throw new Error(`TaskResolved event not found for Task ${taskId}`);
+  }
+
+  console.log(`Task ${taskId} resolved. Final Vote Count: ${majorityCount}/${servers.length}.`);
+  
+  return majorityReached; 
 }
 
 async function main() {
-  console.log("--- Starting Hardhat Task Simulation (Honest & Dishonest Paths) ---");
-
-  const [client, serverA, serverB] = await ethers.getSigners();
+  console.log("--- Starting Hardhat N-Server Commit-Reveal Simulation ---");
+  
+  const signers = await ethers.getSigners();
+  const client = signers[0];
+  const servers = signers.slice(1, 6)
+  const N = servers.length;
 
   const ReplicatedVerifier = await ethers.getContractFactory("ReplicatedVerifier");
   const verifier = await ReplicatedVerifier.deploy();
   await verifier.waitForDeployment();
-  console.log(`Contract deployed to: ${verifier.address}`);
+  const deployedAddress = await verifier.getAddress();
+  console.log(`Contract deployed to: ${deployedAddress}`);
 
   const STAKE_AMOUNT = ethers.parseEther("1.0");
   const CLIENT_PAYMENT = ethers.parseEther("0.2");
   const TASK_HASH = "0x123456789012345678901234567890123456789012345678901234567890abcd";
 
-  // Honest scenario
-  await runScenario(
-    "Honest Path (Results Match)",
-    client,
-    serverA,
-    serverB,
-    verifier,
-    1,
-    "correct-result",
-    "correct-result",
-    STAKE_AMOUNT,
-    CLIENT_PAYMENT,
-    TASK_HASH
+  // --- Scenario 1: Full Match (5/5) ---
+  const results1 = ["correct", "correct", "correct", "correct", "correct"];
+  const match1 = await runScenario(
+    "1. Full Match (5/5)",
+    client, servers, verifier, 1, results1,
+    STAKE_AMOUNT, CLIENT_PAYMENT, TASK_HASH
   );
-  console.log("Status: ✅ SUCCESS - Servers were rewarded.");
+  if (match1) {
+    console.log("Result: ✅ SUCCESS - All servers were rewarded.");
+  } else {
+    console.log("Result: 🚨 ERROR - Expected match, but contract reported failure.");
+  }
 
-  // Dishonest scenario
-  await runScenario(
-    "Dishonest Path (Results Mismatch)",
-    client,
-    serverA,
-    serverB,
-    verifier,
-    2,
-    "correct-result",
-    "wrong-result",
-    STAKE_AMOUNT,
-    CLIENT_PAYMENT,
-    TASK_HASH
+
+  // --- Scenario 2: Majority Match (3/5) ---
+  const results2 = ["correct", "correct", "correct", "wrong_A", "wrong_B"];
+  const match2 = await runScenario(
+    "2. Majority Match (3/5)",
+    client, servers, verifier, 2, results2,
+    STAKE_AMOUNT, CLIENT_PAYMENT, TASK_HASH
   );
-  console.log("Status: ❌ FAIL - Stakes were forfeited due to disagreement.");
+  if (match2) {
+    console.log("Result: ✅ SUCCESS - Majority (3) rewarded; Minority (2) forfeited stakes.");
+  } else {
+    console.log("Result: ❌ FAIL - Expected majority, but contract reported no majority.");
+  }
 
-  console.log("\n--- Full Task Simulation Complete ---");
+
+  // --- Scenario 3: No Majority (2/2/1 Split) ---
+  const results3 = ["correct_A", "correct_A", "correct_B", "correct_B", "wrong_C"];
+  const match3 = await runScenario(
+    "3. No Majority (2/2/1)",
+    client, servers, verifier, 3, results3,
+    STAKE_AMOUNT, CLIENT_PAYMENT, TASK_HASH
+  );
+  if (match3) {
+    console.log("Result: 🚨 ERROR - Expected no majority, but contract reported success.");
+  } else {
+    console.log("Result: ❌ FAIL - No majority reached. All stakes were forfeited.");
+  }
+
+  console.log("\n--- Full N-Server Simulation Complete ---");
 }
 
 main()
